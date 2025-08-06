@@ -1,21 +1,36 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from langchain.chat_models import ChatOpenAI
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.vectorstores import FAISS
-from langchain.text_splitter import RecursiveCharacterTextSplitter  
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+from groq import Groq
 import os
 
+# Load environment variables from .env
 load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-app = FastAPI()
-llm = ChatOpenAI(api_key=OPENAI_API_KEY, model_name="gpt-3.5-turbo", temperature=0.2)
-vector = None
-qa_chain = None
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+if not GROQ_API_KEY:
+    raise ValueError("Valid GROQ_API_KEY is missing in .env file.")
+
+# Initialize Groq client
+groq_client = Groq(api_key=GROQ_API_KEY)
+
+# Initialize FastAPI
+app = FastAPI(title="AI Tutor API")
+
+# CORS settings (for frontend communication)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Change to your frontend URL in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global chat history
+chat_history = []
+
+# Request models
 class TutorRequest(BaseModel):
     subject: str
     level: str
@@ -28,36 +43,68 @@ class FollowupRequest(BaseModel):
 
 @app.post("/tutor")
 def create_tutor_request(request: TutorRequest):
-    global vector, qa_chain
-    try: 
+    """Handles the first tutor question using LLaMA."""
+    global chat_history
+    try:
         prompt = f"""
-        You are an AI tutor expert in {request.subject} at {request.level} level with {request.style} learning style in {request.language}. Question: {request.question}
+        You are an AI tutor expert in {request.subject} at {request.level} level 
+        with a {request.style} learning style in {request.language}.
+
+        Question: {request.question}
 
         Provide a clear, structured explanation with examples.
         """
 
-        response = llm.invoke(prompt)
-        answer = response.content
+        # Call LLaMA via Groq
+        response = groq_client.chat.completions.create(
+            model="llama3-8b-8192",
+            messages=[
+                {"role": "system", "content": "You are a helpful tutor."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.2
+        )
 
-        embeddings = OpenAIEmbeddings()
-        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        chunks = splitter.split_text(answer)
-        vectorstore = FAISS.from_texts(chunks, embeddings)
-        memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-        qa_chain = ConversationalRetrievalChain.from_llm(llm=llm, vectorstore=vectorstore, memory=memory)
-        
+        answer = response.choices[0].message.content
+        chat_history = [(request.question, answer)]
+
         return {"answer": answer}
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"LLaMA error: {str(e)}")
+
+
 @app.post("/ask")
-def ask_followup(question: FollowupQuestion):
-    global qa_chain
-    if not qa_chain:
-        raise HTTPException(status_code=400, detail="You must first generate an explanation.")
-    
+def ask_followup(request: FollowupRequest):
+    """Handles follow-up questions with LLaMA."""
+    global chat_history
+    if not chat_history:
+        raise HTTPException(
+            status_code=400,
+            detail="No active conversation. Please start with /tutor first."
+        )
+
     try:
-        result = qa_chain({"question": question.question})
-        return {"answer": result["answer"]}
+        # Build conversation history
+        messages = [{"role": "system", "content": "You are a helpful tutor."}]
+        for q, a in chat_history:
+            messages.append({"role": "user", "content": q})
+            messages.append({"role": "assistant", "content": a})
+
+        # Add new question
+        messages.append({"role": "user", "content": request.question})
+
+        # Call LLaMA via Groq
+        response = groq_client.chat.completions.create(
+            model="llama3-8b-8192",
+            messages=messages,
+            temperature=0.2
+        )
+
+        answer = response.choices[0].message.content
+        chat_history.append((request.question, answer))
+
+        return {"answer": answer}
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
+        raise HTTPException(status_code=500, detail=f"LLaMA error: {str(e)}")
